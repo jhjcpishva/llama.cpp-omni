@@ -6,6 +6,7 @@
 #include "common.h"
 #include "log.h"
 #include "arg.h"
+#include "server-tts-voices.h"
 
 #include <mutex>
 #include <thread>
@@ -13,6 +14,7 @@
 #include <string>
 #include <cstring>
 #include <atomic>
+#include <cstdlib>
 #include <signal.h>
 
 #include "httplib.h"
@@ -132,39 +134,60 @@ static std::vector<float> voxcpm2_load_wav_from_memory(const std::vector<uint8_t
     const auto * p = data.data();
     if (memcmp(p, "RIFF", 4) != 0 || memcmp(p + 8, "WAVE", 4) != 0) return {};
 
-    int16_t audio_format = 0, num_channels = 0, bits_per_sample = 0;
-    int32_t sample_rate = 0, data_size = 0;
-    size_t offset = 12;
-    while (offset + 8 <= data.size()) {
-        char id[4]; int32_t size;
-        memcpy(id, p + offset, 4); offset += 4;
-        memcpy(&size, p + offset, 4); offset += 4;
+    auto u16 = [&](size_t at) -> uint16_t { return p[at] | (uint16_t(p[at + 1]) << 8); };
+    auto u32 = [&](size_t at) -> uint32_t { return u16(at) | (uint32_t(u16(at + 2)) << 16); };
+    size_t end = u32(4);
+    if (end > data.size() - 8 || end < 36) return {};
+    end += 8;
+    uint16_t audio_format = 0, num_channels = 0, bits_per_sample = 0, block_align = 0;
+    uint32_t sample_rate = 0;
+    size_t data_offset = 0, data_size = 0;
+    for (size_t offset = 12; offset + 8 <= end;) {
+        const auto * id = p + offset;
+        size_t size = u32(offset + 4);
+        offset += 8;
+        if (size > end - offset) return {};
         if (memcmp(id, "fmt ", 4) == 0) {
-            if (offset + 16 > data.size()) return {};
-            memcpy(&audio_format, p + offset, 2);
-            memcpy(&num_channels, p + offset + 2, 2);
-            memcpy(&sample_rate, p + offset + 4, 4);
-            memcpy(&bits_per_sample, p + offset + 14, 2);
-            offset += size;
+            if (size < 16) return {};
+            audio_format = u16(offset);
+            num_channels = u16(offset + 2);
+            sample_rate = u32(offset + 4);
+            block_align = u16(offset + 12);
+            bits_per_sample = u16(offset + 14);
         } else if (memcmp(id, "data", 4) == 0) {
+            data_offset = offset;
             data_size = size;
-            break;
-        } else {
-            offset += size;
         }
+        offset += size + (size & 1);
+        if (offset > end) return {};
     }
-    if (audio_format != 1 || data_size <= 0 || num_channels < 1) return {};
+    if (audio_format != 1 || bits_per_sample != 16 || !num_channels || !sample_rate ||
+        sample_rate > uint32_t(std::numeric_limits<int>::max()) || block_align != num_channels * 2 ||
+        !data_size || data_size % block_align != 0) return {};
 
-    out_sr = sample_rate;
-    int n_samples = data_size / (bits_per_sample / 8);
-    const auto * raw = reinterpret_cast<const int16_t *>(p + offset);
-    std::vector<float> pcm(n_samples / num_channels);
-    for (int i = 0; i < n_samples / num_channels; ++i) {
+    out_sr = int(sample_rate);
+    std::vector<float> pcm(data_size / block_align);
+    for (size_t i = 0; i < pcm.size(); ++i) {
         float sum = 0.0f;
-        for (int ch = 0; ch < num_channels; ++ch) {
-            sum += static_cast<float>(raw[i * num_channels + ch]) / 32768.0f;
+        for (uint16_t ch = 0; ch < num_channels; ++ch) {
+            sum += float(int16_t(u16(data_offset + i * block_align + ch * 2))) / 32768.0f;
         }
-        pcm[i] = sum / static_cast<float>(num_channels);
+        pcm[i] = sum / num_channels;
+    }
+    return pcm;
+}
+
+static std::vector<float> load_tts_reference(const tts_speech_request & request, int & sample_rate) {
+    raw_buffer bytes(request.reference_wav.begin(), request.reference_wav.end());
+    if (!request.reference_base64.empty()) {
+        bytes = base64_decode(request.reference_base64);
+    }
+    if (request.reference_wav.empty() && request.reference_base64.empty()) {
+        return {};
+    }
+    auto pcm = voxcpm2_load_wav_from_memory(bytes, sample_rate);
+    if (pcm.empty()) {
+        throw tts_api_error(400, "Invalid 16-bit PCM WAV reference audio");
     }
     return pcm;
 }
@@ -213,6 +236,69 @@ int main(int argc, char ** argv) {
 #endif
 
     voxcpm2_server_state state;
+    const char * voices_dir = std::getenv("VOXCPM_VOICES_DIR");
+    tts_voice_store voices(voices_dir && *voices_dir ? voices_dir : "voices");
+
+    svr.set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const tts_api_error & e) {
+            res.status = e.status;
+            res.set_content(format_error_response(e.what()).dump(), "application/json");
+        } catch (const json::exception & e) {
+            res.status = 400;
+            res.set_content(format_error_response(e.what()).dump(), "application/json");
+        } catch (const std::exception & e) {
+            res.status = 500;
+            res.set_content(format_error_response(e.what(), "server_error").dump(), "application/json");
+        }
+    });
+
+    svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
+        res_ok(res, {{"object", "list"}, {"data", json::array({
+            {{"id", "voxcpm2"}, {"object", "model"}, {"created", 0}, {"owned_by", "voxcpm2"}}
+        })}});
+    });
+    svr.Get("/v1/audio/voices", [&](const httplib::Request &, httplib::Response & res) {
+        res_ok(res, voices.list());
+    });
+    svr.Get("/v1/audio/voices/:voice_id", [&](const httplib::Request & req, httplib::Response & res) {
+        res_ok(res, voices.get(req.path_params.at("voice_id")));
+    });
+    auto upload_voice = [&](const httplib::Request & req, httplib::Response & res, bool replace) {
+        if (!req.is_multipart_form_data() || req.form.get_file_count("file") != 1) {
+            throw tts_api_error(400, "A single multipart file is required");
+        }
+        auto file = req.form.get_file("file");
+        auto filename = std::filesystem::path(file.filename);
+        std::string extension = filename.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (extension != ".wav") {
+            throw tts_api_error(400, "Only 16-bit PCM WAV reference audio is supported");
+        }
+        std::string id = replace ? req.path_params.at("voice_id") : req.form.get_field("voice_id");
+        if (id.empty()) { id = filename.stem().string(); }
+        tts_voice_store::validate_id(id);
+        if (replace) { voices.get(id); }
+        int sr = 0;
+        if (voxcpm2_load_wav_from_memory(raw_buffer(file.content.begin(), file.content.end()), sr).empty()) {
+            throw tts_api_error(400, "Invalid 16-bit PCM WAV reference audio");
+        }
+        std::string text = req.form.get_field("reference_text");
+        json(text).dump(); // Reject invalid UTF-8 before persisting the transcript.
+        auto result = voices.put(id, file.content, text, replace);
+        res.status = replace ? 200 : 201;
+        res_ok(res, result);
+    };
+    svr.Post("/v1/audio/voices", [&](const httplib::Request & req, httplib::Response & res) {
+        upload_voice(req, res, false);
+    });
+    svr.Put("/v1/audio/voices/:voice_id", [&](const httplib::Request & req, httplib::Response & res) {
+        upload_voice(req, res, true);
+    });
+    svr.Delete("/v1/audio/voices/:voice_id", [&](const httplib::Request & req, httplib::Response & res) {
+        res_ok(res, voices.remove(req.path_params.at("voice_id")));
+    });
 
     // ── Health ────────────────────────────────────────────────────────────
 
@@ -276,28 +362,15 @@ int main(int argc, char ** argv) {
 
     svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_audio_speech\n");
-        json data = json::parse(req.body);
+        auto request = tts_resolve_request(json::parse(req.body), voices);
+        const json & data = request.params;
 
-        std::string input = json_value(data, "input", std::string(""));
-        if (input.empty()) {
-            res_error(res, format_error_response("\"input\" is required"));
-            return;
-        }
-
-        std::string model = json_value(data, "model", std::string(""));
-        if (!model.empty() && model != "voxcpm" && model != "voxcpm2") {
-            res_error(res, format_error_response("unknown model: \"" + model + "\", expected \"voxcpm\""));
-            return;
-        }
+        std::string input = request.input;
 
         std::string response_format = json_value(data, "response_format", std::string("wav"));
-        if (response_format != "wav" && response_format != "pcm") {
-            res_error(res, format_error_response("supported response_format: wav, pcm"));
-            return;
-        }
 
         VoxCPM2GenerateParams gen_params;
-        gen_params.seed                = json_value(data, "seed", 42);
+        gen_params.seed                = json_value(data, "seed", uint32_t(42));
         gen_params.cfg_value           = json_value(data, "cfg_value", 2.0f);
         gen_params.inference_timesteps = json_value(data, "inference_timesteps", 10);
         gen_params.max_steps           = json_value(data, "max_steps", 200);
@@ -313,34 +386,13 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // Ultimate clone (continuation): reference_audio + prompt_text/ref_text
-        // Plain clone: reference_audio only
-        std::string prompt_text = json_value(data, "prompt_text", std::string(""));
-        if (prompt_text.empty()) prompt_text = json_value(data, "reference_text", std::string(""));
-        if (prompt_text.empty()) prompt_text = json_value(data, "ref_text", std::string(""));
-
+        std::string prompt_text = request.reference_text;
+        auto ref_pcm = load_tts_reference(request, gen_params.reference_sample_rate);
         std::vector<float> wav;
-        if (data.contains("reference_audio") && data.at("reference_audio").is_string()) {
-            std::string ref_b64 = data.at("reference_audio").get<std::string>();
-            if (!ref_b64.empty()) {
-                std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
-                int ref_sr = 0;
-                std::vector<float> ref_pcm = voxcpm2_load_wav_from_memory(ref_bytes, ref_sr);
-                if (ref_pcm.empty()) {
-                    res_error(res, format_error_response("Invalid reference_audio WAV data"));
-                    return;
-                }
-                gen_params.reference_sample_rate = ref_sr;
-                if (!prompt_text.empty()) {
-                    LOG_INF("clone+continuation (prompt_text len=%zu)\n", prompt_text.size());
-                    wav = rt->generate_with_continuation(input, prompt_text, ref_pcm, gen_params);
-                } else {
-                    LOG_INF("clone (reference_audio only, no prompt_text)\n");
-                    wav = rt->generate_with_clone(input, ref_pcm, gen_params);
-                }
-            } else {
-                wav = rt->generate(input, gen_params);
-            }
+        if (!ref_pcm.empty()) {
+            wav = prompt_text.empty()
+                ? rt->generate_with_clone(input, ref_pcm, gen_params)
+                : rt->generate_with_continuation(input, prompt_text, ref_pcm, gen_params);
         } else {
             wav = rt->generate(input, gen_params);
         }
@@ -365,22 +417,13 @@ int main(int argc, char ** argv) {
 
     svr.Post("/v1/audio/speech/stream", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_audio_speech_stream\n");
-        json data = json::parse(req.body);
+        auto request = tts_resolve_request(json::parse(req.body), voices);
+        const json & data = request.params;
 
-        std::string input = json_value(data, "input", std::string(""));
-        if (input.empty()) {
-            res_error(res, format_error_response("\"input\" is required"));
-            return;
-        }
-
-        std::string model = json_value(data, "model", std::string(""));
-        if (!model.empty() && model != "voxcpm" && model != "voxcpm2") {
-            res_error(res, format_error_response("unknown model: \"" + model + "\", expected \"voxcpm\""));
-            return;
-        }
+        std::string input = request.input;
 
         VoxCPM2GenerateParams gen_params;
-        gen_params.seed                = json_value(data, "seed", 42);
+        gen_params.seed                = json_value(data, "seed", uint32_t(42));
         gen_params.cfg_value           = json_value(data, "cfg_value", 2.0f);
         gen_params.inference_timesteps = json_value(data, "inference_timesteps", 10);
         gen_params.max_steps           = json_value(data, "max_steps", 200);
@@ -397,10 +440,12 @@ int main(int argc, char ** argv) {
         }
 
         int sr = rt->sample_rate();
+        auto ref_pcm = load_tts_reference(request, gen_params.reference_sample_rate);
+        std::string prompt_text = request.reference_text;
 
         res.set_chunked_content_provider(
             "audio/wav",
-            [rt, input, gen_params, sr, data](size_t /*offset*/, httplib::DataSink & sink) -> bool {
+            [rt, input, gen_params, sr, ref_pcm, prompt_text](size_t /*offset*/, httplib::DataSink & sink) -> bool {
                 // Write WAV header first (with unknown data size)
                 {
                     std::string header;
@@ -415,12 +460,6 @@ int main(int argc, char ** argv) {
                         return false;
                     }
                 }
-
-                bool has_clone = data.contains("reference_audio") && data.at("reference_audio").is_string()
-                                 && !data.at("reference_audio").get<std::string>().empty();
-                std::string prompt_text = json_value(data, "prompt_text", std::string(""));
-                if (prompt_text.empty()) prompt_text = json_value(data, "reference_text", std::string(""));
-                if (prompt_text.empty()) prompt_text = json_value(data, "ref_text", std::string(""));
 
                 // Return false to cancel decode when the HTTP client disconnects.
                 auto chunk_callback = [&sink](const std::vector<float> & chunk, bool /*is_final*/) -> bool {
@@ -438,20 +477,11 @@ int main(int argc, char ** argv) {
                 // Clone uses the same prefill as generate_with_* then patch-wise
                 // decode_streaming_from_ready_state for early TTFA (was: full decode + 100ms fake chunks).
                 VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
-                if (has_clone) {
-                    std::string ref_b64 = data.at("reference_audio").get<std::string>();
-                    std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
-                    int ref_sr = 0;
-                    std::vector<float> ref_pcm = voxcpm2_load_wav_from_memory(ref_bytes, ref_sr);
-                    if (ref_pcm.empty()) {
-                        return false;
-                    }
-                    auto p = gen_params;
-                    p.reference_sample_rate = ref_sr;
+                if (!ref_pcm.empty()) {
                     const bool ok = prompt_text.empty()
-                        ? mutable_rt->generate_with_clone_streaming(input, ref_pcm, chunk_callback, p)
+                        ? mutable_rt->generate_with_clone_streaming(input, ref_pcm, chunk_callback, gen_params)
                         : mutable_rt->generate_with_continuation_streaming(
-                              input, prompt_text, ref_pcm, chunk_callback, p);
+                              input, prompt_text, ref_pcm, chunk_callback, gen_params);
                     if (!ok) {
                         return false;
                     }

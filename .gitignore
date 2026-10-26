@@ -68,6 +68,9 @@
 
 /models/*
 /models-mnt
+
+# Local TTS reference voices and transcripts
+/voices/
 !/models/.editorconfig
 !/models/ggml-vocab-*.gguf*
 !/models/templates
